@@ -66,17 +66,45 @@ await chat.initialize();
 
 ## Configuration
 
+### ACP Mode
+
+All options are optional — defaults are shown below.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `dataDir` | `string` | `~/.chat-adapter-wechat` | Directory for token and state persistence |
+| `pollIntervalMs` | `number` | `25000` | Polling interval in milliseconds |
+| `typingIntervalMs` | `number` | `15000` | Typing indicator heartbeat in milliseconds |
+| `baseUrl` | `string` | `https://ilinkai.weixin.qq.com` | ilink API base URL |
+| `cdnBaseUrl` | `string` | `https://novac2c.cdn.weixin.qq.com/c2c` | CDN base URL for media |
+| `onQrCode` | `(qr: { imageBase64: string; terminalAscii: string }) => void` | — | Callback when a QR code is generated for login |
+| `accountStorage` | `WeChatStorage<AccountData>` | — | Custom persistence for account credentials (replaces disk) |
+| `stateStorage` | `WeChatStorage<PollState>` | — | Custom persistence for poll state (replaces disk) |
+| `logger` | `Logger` | Console logger | Custom logger instance |
+
 ```typescript
 createWeChatAcpAdapter({
-  dataDir: "~/.chat-adapter-wechat",  // Token persistence directory
-  pollIntervalMs: 25000,              // Polling interval (ms)
-  typingIntervalMs: 15000,            // Typing indicator heartbeat (ms)
-  baseUrl: "https://ilinkai.weixin.qq.com",
-  cdnBaseUrl: "https://novac2c.cdn.weixin.qq.com/c2c",
+  pollIntervalMs: 10000,
   onQrCode: (qr) => {
-    // Custom QR display (e.g., render in web UI)
     console.log("QR image base64:", qr.imageBase64);
   },
+  // Optional: custom storage instead of filesystem
+  accountStorage: {
+    load: async () => db.get("wechat-account"),
+    save: async (data) => db.set("wechat-account", data),
+  },
+});
+```
+
+### Bot Mode
+
+```typescript
+createWeChatBotAdapter({
+  appId: process.env.WECHAT_APP_ID!,   // Required — dialog platform app ID
+  token: process.env.WECHAT_TOKEN!,     // Required — dialog platform token
+  aesKey: process.env.WECHAT_AES_KEY!,  // Required — dialog platform AES key
+  baseUrl: "https://openaiapi.weixin.qq.com", // Optional — API base URL
+  env: "online",                        // Optional — "online" (default) or "debug"
 });
 ```
 

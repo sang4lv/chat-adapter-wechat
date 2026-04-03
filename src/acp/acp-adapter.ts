@@ -54,6 +54,8 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
     pollIntervalMs: number;
     typingIntervalMs: number;
     onQrCode?: WeChatAcpAdapterConfig["onQrCode"];
+    accountStorage?: WeChatAcpAdapterConfig["accountStorage"];
+    stateStorage?: WeChatAcpAdapterConfig["stateStorage"];
   };
 
   private pollingActive = false;
@@ -82,6 +84,8 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
       pollIntervalMs: config.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS,
       typingIntervalMs: config.typingIntervalMs ?? DEFAULT_TYPING_INTERVAL_MS,
       onQrCode: config.onQrCode,
+      accountStorage: config.accountStorage,
+      stateStorage: config.stateStorage,
     };
 
     this.client = new IlinkClient({ baseUrl, cdnBaseUrl });
@@ -94,7 +98,7 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
     this.chat = chat;
 
     // Try to load saved account
-    const account = this.loadAccount();
+    const account = await this.loadAccount();
     if (account) {
       this.client.setToken(account.botToken);
       this.setBotUserId(account.userId);
@@ -108,7 +112,7 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
     }
 
     // Load poll state
-    this.pollState = this.loadPollState();
+    this.pollState = await this.loadPollState();
 
     // Start polling
     await this.startPolling();
@@ -120,7 +124,7 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
     if (this.pollingTask) {
       await this.pollingTask.catch(() => {});
     }
-    this.savePollState();
+    await this.savePollState();
   }
 
   // --- QR Login ---
@@ -153,7 +157,7 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
         this.client.setToken(account.botToken);
         this.setBotUserId(account.userId);
         this.setUserName(account.botId);
-        this.saveAccount(account);
+        await this.saveAccount(account);
         this.logger.info("QR login successful", { botId: account.botId });
         return;
       }
@@ -196,7 +200,7 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
           for (const msg of response.msgs) {
             await this.processIncomingMessage(msg);
           }
-          this.savePollState();
+          await this.savePollState();
         }
 
         consecutiveFailures = 0;
@@ -511,7 +515,10 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
 
   // --- Persistence ---
 
-  private loadAccount(): AccountData | null {
+  private async loadAccount(): Promise<AccountData | null> {
+    if (this.config.accountStorage) {
+      return this.config.accountStorage.load();
+    }
     try {
       const filePath = path.join(this.config.dataDir, "account.json");
       const data = fs.readFileSync(filePath, "utf-8");
@@ -521,7 +528,10 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
     }
   }
 
-  private saveAccount(account: AccountData): void {
+  private async saveAccount(account: AccountData): Promise<void> {
+    if (this.config.accountStorage) {
+      return this.config.accountStorage.save(account);
+    }
     fs.mkdirSync(this.config.dataDir, { recursive: true });
     const filePath = path.join(this.config.dataDir, "account.json");
     fs.writeFileSync(filePath, JSON.stringify(account, null, 2), {
@@ -529,7 +539,16 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
     });
   }
 
-  private loadPollState(): PollState {
+  private async loadPollState(): Promise<PollState> {
+    if (this.config.stateStorage) {
+      return (
+        (await this.config.stateStorage.load()) ?? {
+          updatesBuf: "",
+          contextTokens: {},
+          lastMessageId: 0,
+        }
+      );
+    }
     try {
       const filePath = path.join(this.config.dataDir, "state.json");
       const data = fs.readFileSync(filePath, "utf-8");
@@ -539,7 +558,10 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
     }
   }
 
-  private savePollState(): void {
+  private async savePollState(): Promise<void> {
+    if (this.config.stateStorage) {
+      return this.config.stateStorage.save(this.pollState);
+    }
     try {
       fs.mkdirSync(this.config.dataDir, { recursive: true });
       const filePath = path.join(this.config.dataDir, "state.json");

@@ -40,6 +40,11 @@ export interface WeChatRefMessage {
 
 // --- Configuration ---
 
+export interface WeChatStorage<T> {
+  load(): Promise<T | null>;
+  save(data: T): Promise<void>;
+}
+
 export interface WeChatBaseConfig {
   dataDir?: string;
   pollIntervalMs?: number;
@@ -51,6 +56,8 @@ export interface WeChatAcpAdapterConfig extends WeChatBaseConfig {
   baseUrl?: string;
   cdnBaseUrl?: string;
   typingIntervalMs?: number;
+  accountStorage?: WeChatStorage<import("../acp/acp-types.js").AccountData>;
+  stateStorage?: WeChatStorage<import("../acp/acp-types.js").PollState>;
 }
 
 // --- Constants ---
