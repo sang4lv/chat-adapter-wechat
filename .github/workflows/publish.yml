@@ -22,6 +22,7 @@ jobs:
         with:
           node-version: "22"
           cache: pnpm
+          registry-url: https://registry.npmjs.org
 
       - run: pnpm install --frozen-lockfile
 
@@ -31,7 +32,7 @@ jobs:
 
       - run: pnpm build
 
-      - name: Check for changesets
+      - name: Create release PR or publish
         id: changesets
         uses: changesets/action@v1
         with:
@@ -42,6 +43,4 @@ jobs:
 
       - name: Publish to npm
         if: steps.changesets.outputs.hasChangesets == 'false'
-        run: |
-          echo "registry=https://registry.npmjs.org/" > ~/.npmrc
-          pnpm changeset publish --provenance --access public
+        run: npm publish --provenance --access public
