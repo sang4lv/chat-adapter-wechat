@@ -43,4 +43,6 @@ jobs:
 
       - name: Publish to npm
         if: steps.changesets.outputs.hasChangesets == 'false'
-        run: npm publish --provenance --access public
+        run: |
+          sed -i '/_authToken/d' ~/.npmrc
+          npm publish --provenance --access public
