@@ -1,0 +1,54 @@
+{
+  "name": "chat-adapter-wechat",
+  "version": "0.1.0",
+  "description": "WeChat adapter for the Vercel Chat SDK",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./acp": {
+      "types": "./dist/acp/index.d.ts",
+      "import": "./dist/acp/index.js"
+    },
+    "./bot": {
+      "types": "./dist/bot/index.d.ts",
+      "import": "./dist/bot/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist",
+    "dev:server": "tsx scripts/dev-server.ts",
+    "changeset": "changeset",
+    "release": "changeset publish"
+  },
+  "peerDependencies": {
+    "@chat-adapter/shared": ">=4.0.0",
+    "chat": ">=4.0.0"
+  },
+  "devDependencies": {
+    "@changesets/changelog-github": "^0.6.0",
+    "@changesets/cli": "^2.30.0",
+    "@chat-adapter/shared": "^4.23.0",
+    "@types/node": "^22.0.0",
+    "@types/qrcode": "^1.5.6",
+    "chat": "^4.23.0",
+    "qrcode": "^1.5.4",
+    "tsup": "^8.3.5",
+    "tsx": "^4.21.0",
+    "typescript": "^5.7.2",
+    "vitest": "^4.0.0"
+  },
+  "license": "MIT"
+}
