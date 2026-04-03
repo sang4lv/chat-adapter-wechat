@@ -31,7 +31,7 @@
     "clean": "rm -rf dist",
     "dev:server": "tsx scripts/dev-server.ts",
     "changeset": "changeset",
-    "release": "changeset publish"
+    "release": "changeset publish --provenance --access public"
   },
   "peerDependencies": {
     "@chat-adapter/shared": ">=4.0.0",
