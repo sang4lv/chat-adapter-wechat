@@ -50,6 +50,10 @@
     "typescript": "^5.7.2",
     "vitest": "^4.0.0"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sang4lv/chat-adapter-wechat.git"
+  },
   "license": "MIT",
   "packageManager": "pnpm@10.12.4"
 }
