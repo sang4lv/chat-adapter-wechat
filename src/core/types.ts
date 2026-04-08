@@ -46,9 +46,67 @@ export interface WeChatStorage<T> {
 }
 
 export interface WeChatBaseConfig {
+  /**
+   * Optional caller-supplied identifier for this bot instance.
+   *
+   * When set:
+   *  - The adapter's `name` becomes `wechat-acp:${botId}` so multiple
+   *    adapters can coexist in a single `Chat` without colliding on
+   *    chat-sdk's per-adapter dedupe and lock keys.
+   *  - The durable pending queue key is scoped to this bot, so multi-bot
+   *    gateways sharing a single state backend do not cross-drain each
+   *    other's messages.
+   *  - The default `dataDir` is scoped to a per-bot subdirectory so disk
+   *    persistence for multiple bots doesn't collide.
+   *  - `onQrCode` is called with `{ botId }` so the gateway can route the
+   *    QR image to the right frontend.
+   *  - Handlers can read it back from `(message.adapter as WeChatAcpAdapter).botId`.
+   *
+   * Not to be confused with the iLink-assigned `ilink_bot_id` that lands
+   * in `AccountData.botId` after a successful scan — that one identifies
+   * the *scanning WeChat account*, not your logical bot.
+   */
+  botId?: string;
+  /**
+   * Arbitrary opaque payload attached to this adapter instance. The
+   * adapter does not interpret it — it's surfaced unchanged via:
+   *
+   *  - the `context.metadata` argument of `onQrCode` and `onAuthFailure`
+   *  - the public `metadata` field on the adapter (so message handlers
+   *    can read it via `(message.adapter as WeChatAcpAdapter).metadata`)
+   *
+   * Use it to carry whatever per-instance context your gateway needs
+   * (tenant id, display name, region, customer reference, etc.) without
+   * having to maintain an external Map keyed by adapter name.
+   *
+   * `botId` is still required if you need state-storage scoping, queue
+   * partitioning, or chat-sdk adapter-name uniqueness. Think of `botId`
+   * as the *key* and `metadata` as the *value*.
+   */
+  metadata?: Record<string, unknown>;
   dataDir?: string;
   pollIntervalMs?: number;
-  onQrCode?: (qr: { imageBase64: string; terminalAscii: string }) => void;
+  onQrCode?: (
+    qr: { imageBase64: string; terminalAscii: string },
+    context: { botId?: string; metadata?: Record<string, unknown> }
+  ) => void;
+  /**
+   * Called when the polling loop receives an authentication failure
+   * (HTTP 401/403) from iLink, indicating the bot token has expired or
+   * been revoked. The callback runs once, then polling stops cleanly.
+   *
+   * Use this in headless / split-process deployments where the polling
+   * worker cannot show a QR code: signal your scan worker (delete the
+   * stale `AccountData`, emit an event, page someone) and re-onboard the
+   * bot out of band by running `loginWithQr()` from your scan flow.
+   *
+   * If `onAuthFailure` is NOT set, the polling loop falls back to the
+   * legacy behavior of attempting an in-process `loginWithQr()`, which
+   * is only useful for foreground / interactive deployments.
+   */
+  onAuthFailure?: (
+    context: { botId?: string; metadata?: Record<string, unknown> }
+  ) => Promise<void> | void;
   logger?: Logger;
 }
 

@@ -5,9 +5,11 @@ import os from "node:os";
 import type {
   AdapterPostableMessage,
   ChatInstance,
+  Message,
+  QueueEntry,
   RawMessage,
 } from "chat";
-import { ConsoleLogger } from "chat";
+import { ConsoleLogger, Message as ChatMessage } from "chat";
 import {
   extractCard,
   extractFiles,
@@ -36,6 +38,24 @@ import {
 } from "../core/media.js";
 import { IlinkClient } from "./acp-client.js";
 import { MessageType, MessageItemType } from "./acp-types.js";
+
+/**
+ * Key prefix for the WeChat-specific durable pending queue. Messages are
+ * enqueued here BEFORE the iLink getupdates cursor is advanced, so a crash
+ * mid-batch cannot lose messages: state.enqueue is the durability boundary.
+ *
+ * This is intentionally separate from chat-sdk's per-thread queue (which is
+ * scoped to lock-contention concurrency, not crash recovery).
+ *
+ * In multi-bot gateways the key is suffixed with the adapter's `botId` so
+ * instances sharing a single state backend do not cross-drain each other's
+ * messages. See {@link WeChatAcpAdapter.pendingQueueKey}.
+ */
+const PENDING_QUEUE_KEY_PREFIX = "wechat-acp:pending";
+/** Cap on the durable pending queue. Trims oldest when exceeded. */
+const PENDING_QUEUE_MAX_SIZE = 1000;
+/** TTL for entries in the durable pending queue (24h). */
+const PENDING_QUEUE_TTL_MS = 24 * 60 * 60 * 1000;
 import type {
   AccountData,
   PollState,
@@ -44,7 +64,28 @@ import type {
 } from "./acp-types.js";
 
 export class WeChatAcpAdapter extends WeChatBaseAdapter {
-  readonly name = "wechat-acp";
+  /**
+   * Adapter name registered with chat-sdk. Includes the caller-supplied
+   * `botId` so multiple adapters can coexist in a single Chat without
+   * colliding on dedupe/lock keys (which chat-sdk scopes by adapter name).
+   */
+  readonly name: string;
+  /**
+   * Caller-supplied bot identifier. Handlers can read this back via
+   * `(message.adapter as WeChatAcpAdapter).botId` to route messages to
+   * per-bot logic. `undefined` in single-bot deployments.
+   */
+  readonly botId: string | undefined;
+  /**
+   * Caller-supplied opaque metadata. The adapter never reads or mutates
+   * it — it's exposed unchanged so handlers and callbacks can attach
+   * gateway-level context (tenant id, display name, region, etc.) to
+   * each instance without maintaining an external Map.
+   *
+   * Read in handlers via `(message.adapter as WeChatAcpAdapter).metadata`.
+   * Cast to your own typed shape if you want stronger typing.
+   */
+  readonly metadata: Record<string, unknown> | undefined;
 
   private readonly client: IlinkClient;
   private readonly config: {
@@ -54,6 +95,7 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
     pollIntervalMs: number;
     typingIntervalMs: number;
     onQrCode?: WeChatAcpAdapterConfig["onQrCode"];
+    onAuthFailure?: WeChatAcpAdapterConfig["onAuthFailure"];
     accountStorage?: WeChatAcpAdapterConfig["accountStorage"];
     stateStorage?: WeChatAcpAdapterConfig["stateStorage"];
   };
@@ -61,6 +103,7 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
   private pollingActive = false;
   private pollingAbortController: AbortController | null = null;
   private pollingTask: Promise<void> | null = null;
+  private drainPromise: Promise<void> | null = null;
   private pollState: PollState = {
     updatesBuf: "",
     contextTokens: {},
@@ -68,14 +111,21 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
   };
 
   constructor(config: WeChatAcpAdapterConfig = {}) {
-    const logger =
-      config.logger ?? new ConsoleLogger("info").child("wechat-acp");
-    super("wechat-acp", logger);
+    const name = config.botId ? `wechat-acp:${config.botId}` : "wechat-acp";
+    const logger = config.logger ?? new ConsoleLogger("info").child(name);
+    super(name, logger);
+    this.name = name;
+    this.botId = config.botId;
+    this.metadata = config.metadata;
 
     const baseUrl = config.baseUrl ?? DEFAULT_BASE_URL;
     const cdnBaseUrl = config.cdnBaseUrl ?? DEFAULT_CDN_BASE_URL;
-    const dataDir =
-      config.dataDir ?? path.join(os.homedir(), ".chat-adapter-wechat");
+    // Default dataDir is per-bot so parallel adapters don't stomp on each
+    // other's account.json / state.json files.
+    const defaultDataDir = config.botId
+      ? path.join(os.homedir(), ".chat-adapter-wechat", config.botId)
+      : path.join(os.homedir(), ".chat-adapter-wechat");
+    const dataDir = config.dataDir ?? defaultDataDir;
 
     this.config = {
       baseUrl,
@@ -84,6 +134,7 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
       pollIntervalMs: config.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS,
       typingIntervalMs: config.typingIntervalMs ?? DEFAULT_TYPING_INTERVAL_MS,
       onQrCode: config.onQrCode,
+      onAuthFailure: config.onAuthFailure,
       accountStorage: config.accountStorage,
       stateStorage: config.stateStorage,
     };
@@ -94,25 +145,50 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
 
   // --- Lifecycle ---
 
-  async initialize(chat: ChatInstance): Promise<void> {
+  /**
+   * Bring the adapter online.
+   *
+   * Default behavior (single-process / interactive): if no account is in
+   * storage, trigger an in-process QR scan via `loginWithQr` before
+   * starting the polling loop.
+   *
+   * Headless / split-process behavior: pass
+   * `{ requireExistingAccount: true }` to refuse the implicit scan and
+   * throw if no account is in storage. Use this in polling workers
+   * whose credentials were provisioned out of band by `loginWithQr`
+   * running in a separate scan worker.
+   */
+  async initialize(
+    chat: ChatInstance,
+    options: { requireExistingAccount?: boolean } = {}
+  ): Promise<void> {
     this.chat = chat;
 
     // Try to load saved account
     const account = await this.loadAccount();
     if (account) {
-      this.client.setToken(account.botToken);
-      this.setBotUserId(account.userId);
-      this.setUserName(account.botId);
+      this.applyAccount(account);
       this.logger.info("Loaded saved WeChat bot account", {
         botId: account.botId,
       });
+    } else if (options.requireExistingAccount) {
+      throw new Error(
+        `WeChatAcpAdapter${
+          this.botId ? `[${this.botId}]` : ""
+        }: requireExistingAccount is set but no AccountData was found in ` +
+          `accountStorage. Run loginWithQr() in your scan worker first.`
+      );
     } else {
-      // QR code login
-      await this.qrLogin();
+      // QR code login (interactive / single-process)
+      await this.loginWithQr();
     }
 
     // Load poll state
     this.pollState = await this.loadPollState();
+
+    // Drain any messages persisted by a prior instance that crashed before
+    // their handlers could run. Fire-and-forget — runs alongside polling.
+    this.scheduleDrain();
 
     // Start polling
     await this.startPolling();
@@ -124,20 +200,38 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
     if (this.pollingTask) {
       await this.pollingTask.catch(() => {});
     }
+    if (this.drainPromise) {
+      await this.drainPromise.catch(() => {});
+    }
     await this.savePollState();
   }
 
   // --- QR Login ---
 
-  private async qrLogin(): Promise<void> {
+  /**
+   * Run the QR-scan flow end-to-end and persist the resulting
+   * `AccountData` via `accountStorage`.
+   *
+   * No `Chat` instance is required — this method is safe to call from a
+   * dedicated scan worker / API handler that has no polling lifecycle.
+   * After it resolves, a polling worker pointed at the same
+   * `accountStorage` can call `initialize(chat, { requireExistingAccount:
+   * true })` to come online without re-scanning.
+   *
+   * @returns The persisted `AccountData`.
+   */
+  async loginWithQr(): Promise<AccountData> {
     this.logger.info("Starting QR code login...");
     const qr = await this.client.fetchQrCode();
 
     if (this.config.onQrCode) {
-      this.config.onQrCode({
-        imageBase64: qr.qrcode_img_content,
-        terminalAscii: "",
-      });
+      this.config.onQrCode(
+        {
+          imageBase64: qr.qrcode_img_content,
+          terminalAscii: "",
+        },
+        { botId: this.botId, metadata: this.metadata }
+      );
     } else {
       this.logger.info(
         "Scan QR code to login (base64 image available in onQrCode callback)"
@@ -154,17 +248,22 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
           baseUrl: this.config.baseUrl,
           savedAt: Date.now(),
         };
-        this.client.setToken(account.botToken);
-        this.setBotUserId(account.userId);
-        this.setUserName(account.botId);
+        this.applyAccount(account);
         await this.saveAccount(account);
         this.logger.info("QR login successful", { botId: account.botId });
-        return;
+        return account;
       }
       if (status.status === "expired") {
         throw new Error("QR code expired. Please restart to try again.");
       }
     }
+  }
+
+  /** Apply credentials from an `AccountData` to the live client + bot identity. */
+  private applyAccount(account: AccountData): void {
+    this.client.setToken(account.botToken);
+    this.setBotUserId(account.userId);
+    this.setUserName(account.botId);
   }
 
   // --- Polling ---
@@ -192,26 +291,39 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
           this.pollingAbortController?.signal
         );
 
-        if (response.get_updates_buf) {
-          this.pollState.updatesBuf = response.get_updates_buf;
-        }
-
-        if (response.msgs?.length) {
-          for (const msg of response.msgs) {
-            await this.processIncomingMessage(msg);
-          }
-          await this.savePollState();
-        }
+        await this.handlePollResponse(response);
 
         consecutiveFailures = 0;
       } catch (error) {
         if (!this.pollingActive) return;
 
-        // On auth failure, attempt re-login
+        // On auth failure, prefer the caller's onAuthFailure hook (for
+        // headless workers that need to hand off to a separate scan
+        // process). Fall back to the legacy in-process re-login when no
+        // hook is configured, to preserve interactive single-process
+        // deployments.
         if (error instanceof AuthenticationError) {
+          if (this.config.onAuthFailure) {
+            this.logger.warn(
+              "Auth token invalid; invoking onAuthFailure and stopping polling",
+              { botId: this.botId }
+            );
+            try {
+              await this.config.onAuthFailure({
+                botId: this.botId,
+                metadata: this.metadata,
+              });
+            } catch (hookError) {
+              this.logger.error("onAuthFailure callback threw", {
+                error: String(hookError),
+              });
+            }
+            this.pollingActive = false;
+            return;
+          }
           this.logger.warn("Auth token invalid, attempting re-login...");
           try {
-            await this.qrLogin();
+            await this.loginWithQr();
             consecutiveFailures = 0;
             continue;
           } catch (reLoginError) {
@@ -232,34 +344,136 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
     }
   }
 
-  private async processIncomingMessage(msg: IlinkMessage): Promise<void> {
-    // Skip bot messages
-    if (msg.message_type === MessageType.BOT) return;
-    // Skip duplicates
-    if (
-      msg.message_id != null &&
-      msg.message_id <= this.pollState.lastMessageId
-    )
-      return;
-
-    if (msg.message_id != null) {
-      this.pollState.lastMessageId = msg.message_id;
+  /**
+   * Process the result of a single getupdates poll.
+   *
+   * Crash-resilience guarantee: messages are durably persisted to the
+   * chat-sdk state queue BEFORE the iLink cursor is advanced. iLink does
+   * not redeliver messages once the cursor moves, so any code path that
+   * advances `pollState.updatesBuf` before persisting is unsafe — a crash
+   * between getupdates returning and dispatch finishing would silently
+   * drop the message.
+   *
+   * Ordering:
+   *  1. Persist every message in the batch to the durable pending queue.
+   *  2. Advance the cursor and save poll state.
+   *  3. Trigger the (background) drainer which dispatches handlers via
+   *     `chat.processMessage`. Chat-sdk's built-in dedupe handles the case
+   *     where step 1 succeeded but a crash before step 2 caused this batch
+   *     to be re-fetched on a fresh instance.
+   */
+  protected async handlePollResponse(response: {
+    msgs?: IlinkMessage[];
+    get_updates_buf?: string;
+  }): Promise<void> {
+    if (response.msgs?.length) {
+      for (const msg of response.msgs) {
+        await this.persistIncomingMessage(msg);
+      }
     }
 
-    // Track context token keyed by conversation (group or DM)
+    // Advance cursor only after every message in the batch is durable.
+    if (response.get_updates_buf) {
+      this.pollState.updatesBuf = response.get_updates_buf;
+    }
+    if (response.msgs?.length || response.get_updates_buf) {
+      await this.savePollState();
+    }
+
+    // Kick the background drainer (no-op if one is already running).
+    if (response.msgs?.length) {
+      this.scheduleDrain();
+    }
+  }
+
+  /**
+   * Convert an iLink message to a chat-sdk Message and append it to the
+   * durable pending queue. Skips bot-authored messages. Idempotency across
+   * crash-induced re-fetches is provided by chat-sdk's dedupe at dispatch
+   * time, not by this method — duplicate enqueues are intentionally allowed
+   * here so we never lose a message in the gap between dedupe and persist.
+   */
+  protected async persistIncomingMessage(msg: IlinkMessage): Promise<void> {
+    if (msg.message_type === MessageType.BOT) return;
+    if (msg.message_id == null) return;
+    if (!this.chat) return;
+
+    // Track context token keyed by conversation (group or DM). This is
+    // in-memory only and best-effort; recreation on a fresh instance is OK
+    // because subsequent messages carry their own context_token.
     const conversationKey = msg.group_id || msg.from_user_id;
     if (conversationKey && msg.context_token) {
       this.pollState.contextTokens[conversationKey] = msg.context_token;
     }
+    if (msg.message_id > this.pollState.lastMessageId) {
+      this.pollState.lastMessageId = msg.message_id;
+    }
 
-    // Convert to WeChatRawMessage
     const rawMessage = this.ilinkToRawMessage(msg);
     const message = this.parseMessage(rawMessage);
 
-    // Dispatch to Chat SDK
-    if (this.chat) {
+    const state = this.chat.getState();
+    const now = Date.now();
+    const entry: QueueEntry = {
+      message,
+      enqueuedAt: now,
+      expiresAt: now + PENDING_QUEUE_TTL_MS,
+    };
+    await state.enqueue(this.pendingQueueKey, entry, PENDING_QUEUE_MAX_SIZE);
+  }
+
+  /**
+   * Start the background drainer if it's not already running. Safe to call
+   * concurrently — only one drain loop runs at a time.
+   */
+  protected scheduleDrain(): void {
+    if (this.drainPromise) return;
+    if (!this.chat) return;
+    this.drainPromise = this.drainPendingQueue().finally(() => {
+      this.drainPromise = null;
+    });
+  }
+
+  /**
+   * Drain the durable pending queue, dispatching each message via
+   * `chat.processMessage`. Chat-sdk dedupes by message id, so re-fetched
+   * messages from a previous crashed batch are skipped automatically.
+   *
+   * Stops draining when polling stops or when the queue is empty.
+   */
+  protected async drainPendingQueue(): Promise<void> {
+    if (!this.chat) return;
+    const state = this.chat.getState();
+    while (true) {
+      const entry = await state.dequeue(this.pendingQueueKey);
+      if (!entry) return;
+      if (Date.now() > entry.expiresAt) continue;
+
+      // After a JSON roundtrip via the state adapter, entry.message is a
+      // plain object. Rehydrate it back into a Message instance so chat-sdk
+      // can use class methods like detectMention.
+      const message = this.rehydrateMessage(entry.message);
       this.chat.processMessage(this, message.threadId, message);
     }
+  }
+
+  /**
+   * State-key partition for this adapter's durable pending queue. Includes
+   * the bot id so multiple adapters sharing one state backend never
+   * cross-drain each other's messages.
+   */
+  protected get pendingQueueKey(): string {
+    return this.botId
+      ? `${PENDING_QUEUE_KEY_PREFIX}:${this.botId}`
+      : PENDING_QUEUE_KEY_PREFIX;
+  }
+
+  private rehydrateMessage(raw: Message): Message {
+    if (raw instanceof ChatMessage) return raw;
+    // After JSON roundtrip the entry stored a plain object, but the
+    // QueueEntry type still types it as Message. Cast through unknown
+    // because Message.fromJSON expects its own SerializedMessage shape.
+    return ChatMessage.fromJSON(raw as unknown as Parameters<typeof ChatMessage.fromJSON>[0]);
   }
 
   private ilinkToRawMessage(msg: IlinkMessage): WeChatRawMessage {
