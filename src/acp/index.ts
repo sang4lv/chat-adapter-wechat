@@ -1,4 +1,9 @@
-export { createWeChatAcpAdapter, WeChatAcpAdapter } from "./acp-adapter.js";
+export {
+  createWeChatAcpAdapter,
+  WeChatAcpAdapter,
+  QrLoginError,
+} from "./acp-adapter.js";
+export type { QrLoginSession } from "./acp-adapter.js";
 export type {
   WeChatAcpAdapterConfig,
   WeChatStorage,

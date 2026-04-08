@@ -631,6 +631,283 @@ describe("ACP crash resilience", () => {
     });
   });
 
+  it("drainPendingQueue exits promptly when isShutdown flips, even with messages still queued", async () => {
+    // Regression test for review feedback: previously the drainer ran
+    // until the queue was empty, blocking disconnect() on a large
+    // backlog. Now it checks `isShutdown` on every iteration so a
+    // disconnect-mid-drain can interrupt promptly.
+    const { adapter, state, processMessage } = await setupAdapter();
+
+    // Pre-seed 50 entries in the pending queue.
+    for (let i = 1; i <= 50; i++) {
+      const liveMessage = adapter.parseMessage({
+        messageId: i,
+        fromUserId: `u${i}`,
+        toUserId: "bot",
+        text: `m${i}`,
+        createTime: Date.now(),
+        media: [],
+        raw: {},
+      });
+      await state.enqueue(
+        "wechat-acp:pending",
+        {
+          message: liveMessage,
+          enqueuedAt: Date.now(),
+          expiresAt: Date.now() + 60_000,
+        },
+        100
+      );
+    }
+
+    // Flip isShutdown BEFORE running the drainer — it must exit on the
+    // first loop iteration without dispatching anything.
+    (adapter as unknown as { isShutdown: boolean }).isShutdown = true;
+    await (
+      adapter as unknown as { drainPendingQueue: () => Promise<void> }
+    ).drainPendingQueue();
+
+    expect(processMessage).not.toHaveBeenCalled();
+    // The 50 entries are still in the queue — drain stopped at the top
+    // of the loop without consuming any.
+    expect(await state.queueDepth("wechat-acp:pending")).toBe(50);
+  });
+
+  it("disconnect() sets isShutdown so a long backlog cannot block it", async () => {
+    // Verifies the disconnect path itself flips the flag. Pure
+    // unit-style: just call disconnect and observe the field.
+    const { adapter } = await setupAdapter();
+    await adapter.disconnect();
+    expect((adapter as unknown as { isShutdown: boolean }).isShutdown).toBe(
+      true
+    );
+  });
+
+  it("persistIncomingMessage skips ids already covered by lastMessageId (within-instance dedup)", async () => {
+    const { adapter, state } = await setupAdapter();
+    (adapter as unknown as {
+      pollState: { lastMessageId: number; updatesBuf: string; contextTokens: object };
+    }).pollState = {
+      updatesBuf: "",
+      contextTokens: {},
+      lastMessageId: 5, // pretend we've already seen up to id 5
+    };
+
+    // Persist messages 4, 5, 6 in order. 4 and 5 should be skipped, 6
+    // should make it through.
+    for (const id of [4, 5, 6]) {
+      await (
+        adapter as unknown as {
+          persistIncomingMessage: (m: IlinkMessage) => Promise<void>;
+        }
+      ).persistIncomingMessage(makeIlinkMessage(id));
+    }
+
+    expect(await state.queueDepth("wechat-acp:pending")).toBe(1);
+    expect(
+      (adapter as unknown as { pollState: { lastMessageId: number } })
+        .pollState.lastMessageId
+    ).toBe(6);
+  });
+
+  it("startQrLogin() returns the QR image immediately and the result resolves on confirmed", async () => {
+    let saved: unknown = null;
+    const adapter = createWeChatAcpAdapter({
+      baseUrl: "https://test.example",
+      botId: "scan-only",
+      accountStorage: {
+        load: async () => null,
+        save: async (data) => {
+          saved = data;
+        },
+      },
+    });
+
+    // Two poll responses: first "wait", then "confirmed". Verifies the
+    // loop actually iterates and doesn't just resolve on the first call.
+    const statuses: Array<{ status: "wait" | "confirmed"; bot_token?: string; ilink_bot_id?: string; ilink_user_id?: string }> = [
+      { status: "wait" },
+      {
+        status: "confirmed",
+        bot_token: "tok",
+        ilink_bot_id: "ilink-bot",
+        ilink_user_id: "ilink-user",
+      },
+    ];
+    (adapter as unknown as { client: unknown }).client = {
+      fetchQrCode: async () => ({
+        qrcode: "qr-token",
+        qrcode_img_content: "base64-png",
+      }),
+      pollQrStatus: vi.fn(async () => statuses.shift()!),
+      setToken: () => {},
+    };
+
+    const session = await adapter.startQrLogin();
+    // QR image is returned synchronously w.r.t. the awaited startQrLogin.
+    expect(session.qrcode.imageBase64).toBe("base64-png");
+    // Result resolves once the second poll returns confirmed.
+    const account = await session.result;
+    expect(account.botToken).toBe("tok");
+    expect(saved).toEqual(account);
+  });
+
+  it("startQrLogin() result rejects with QrLoginError('expired') when iLink expires the code", async () => {
+    const { QrLoginError } = await import("../../src/acp/acp-adapter.js");
+    const adapter = createWeChatAcpAdapter({
+      baseUrl: "https://test.example",
+      botId: "scan-only",
+    });
+    (adapter as unknown as { client: unknown }).client = {
+      fetchQrCode: async () => ({
+        qrcode: "qr-token",
+        qrcode_img_content: "base64-png",
+      }),
+      pollQrStatus: async () => ({ status: "expired" }),
+      setToken: () => {},
+    };
+
+    const session = await adapter.startQrLogin();
+    await expect(session.result).rejects.toBeInstanceOf(QrLoginError);
+    await expect(session.result).rejects.toMatchObject({ code: "expired" });
+  });
+
+  it("startQrLogin() result rejects with QrLoginError('cancelled') when cancel() is called", async () => {
+    const { QrLoginError } = await import("../../src/acp/acp-adapter.js");
+    const adapter = createWeChatAcpAdapter({
+      baseUrl: "https://test.example",
+      botId: "scan-only",
+    });
+    let pollCalls = 0;
+    (adapter as unknown as { client: unknown }).client = {
+      fetchQrCode: async () => ({
+        qrcode: "qr-token",
+        qrcode_img_content: "base64-png",
+      }),
+      pollQrStatus: async () => {
+        pollCalls++;
+        // Tiny delay so the test can call cancel mid-poll.
+        await new Promise((r) => setTimeout(r, 5));
+        return { status: "wait" } as const;
+      },
+      setToken: () => {},
+    };
+
+    const session = await adapter.startQrLogin();
+    // Let one poll iteration happen, then cancel.
+    await new Promise((r) => setTimeout(r, 20));
+    session.cancel();
+    await expect(session.result).rejects.toMatchObject({
+      code: "cancelled",
+    });
+    expect(pollCalls).toBeGreaterThan(0);
+  });
+
+  it("disconnect() cancels in-flight QR login sessions", async () => {
+    const { QrLoginError } = await import("../../src/acp/acp-adapter.js");
+    const adapter = createWeChatAcpAdapter({
+      baseUrl: "https://test.example",
+      botId: "scan-only",
+    });
+    (adapter as unknown as { client: unknown }).client = {
+      fetchQrCode: async () => ({
+        qrcode: "qr-token",
+        qrcode_img_content: "base64-png",
+      }),
+      pollQrStatus: async () => {
+        await new Promise((r) => setTimeout(r, 5));
+        return { status: "wait" } as const;
+      },
+      setToken: () => {},
+    };
+
+    const session = await adapter.startQrLogin();
+    // Give the loop a tick to enter, then disconnect.
+    await new Promise((r) => setTimeout(r, 10));
+    await adapter.disconnect();
+    await expect(session.result).rejects.toBeInstanceOf(QrLoginError);
+    await expect(session.result).rejects.toMatchObject({
+      code: "cancelled",
+    });
+  });
+
+  it("startQrLogin() result has its own .catch so an unawaited rejection does not crash the process", async () => {
+    // Regression: previously a result promise that rejected without an
+    // attached handler would surface as an unhandled rejection. Now
+    // startQrLogin attaches an internal .catch(noop). This test
+    // verifies the rejection is observable to the caller AND that
+    // process.on('unhandledRejection') would not fire.
+    const { QrLoginError } = await import("../../src/acp/acp-adapter.js");
+    const adapter = createWeChatAcpAdapter({
+      baseUrl: "https://test.example",
+      botId: "scan-only",
+    });
+    (adapter as unknown as { client: unknown }).client = {
+      fetchQrCode: async () => ({
+        qrcode: "qr-token",
+        qrcode_img_content: "base64-png",
+      }),
+      pollQrStatus: async () => ({ status: "expired" }),
+      setToken: () => {},
+    };
+
+    let unhandled: unknown = null;
+    const onUnhandled = (reason: unknown) => {
+      unhandled = reason;
+    };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const session = await adapter.startQrLogin();
+      // Deliberately do NOT attach a handler to session.result.
+      // Wait long enough for the rejection to propagate.
+      await new Promise((r) => setTimeout(r, 20));
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+    expect(unhandled).toBeNull();
+    // ... but explicit awaiters still see the rejection.
+    const session = await adapter.startQrLogin();
+    await expect(session.result).rejects.toBeInstanceOf(QrLoginError);
+  });
+
+  it("loginWithQr() (convenience wrapper) still works for the interactive case", async () => {
+    let saved: unknown = null;
+    const onQrCode = vi.fn();
+    const adapter = createWeChatAcpAdapter({
+      baseUrl: "https://test.example",
+      botId: "interactive",
+      onQrCode,
+      accountStorage: {
+        load: async () => null,
+        save: async (data) => {
+          saved = data;
+        },
+      },
+    });
+    (adapter as unknown as { client: unknown }).client = {
+      fetchQrCode: async () => ({
+        qrcode: "qr-token",
+        qrcode_img_content: "base64-png",
+      }),
+      pollQrStatus: async () => ({
+        status: "confirmed",
+        bot_token: "tok",
+        ilink_bot_id: "ilink-bot",
+        ilink_user_id: "ilink-user",
+      }),
+      setToken: () => {},
+    };
+
+    const account = await adapter.loginWithQr();
+    expect(account.botToken).toBe("tok");
+    expect(saved).toEqual(account);
+    expect(onQrCode).toHaveBeenCalledOnce();
+    expect(onQrCode.mock.calls[0]![1]).toEqual({
+      botId: "interactive",
+      metadata: undefined,
+    });
+  });
+
   it("rehydrates messages after a JSON roundtrip through the state adapter", async () => {
     // Simulates state-pg's JSON serialization: messages come back out of
     // dequeue as plain objects, not Message instances. The adapter must
