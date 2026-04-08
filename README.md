@@ -182,27 +182,82 @@ await chat.initialize();
 ##### Split scan and polling across processes
 
 When the scan UI lives in a separate process (e.g. an admin web app)
-from the long-running polling worker, use `loginWithQr()` on the scan
-side and `initialize(chat, { requireExistingAccount: true })` on the
-polling side. Both processes point at the same shared `accountStorage`
-so credentials flow between them via the database.
+from the long-running polling worker, use `startQrLogin()` (or its
+convenience wrapper `loginWithQr()`) on the scan side and
+`initialize(chat, { requireExistingAccount: true })` on the polling
+side. Both processes point at the same shared `accountStorage` so
+credentials flow between them via the database.
 
-**Scan worker — onboard a bot once:**
+**Scan worker — onboard a bot from an HTTP handler:**
+
+The decoupled `startQrLogin()` API is the right tool for HTTP scan
+flows. It returns the QR image immediately and a deferred `result`
+promise that the handler can fire-and-forget — the HTTP request
+closes right away instead of holding the connection open for the
+entire scan window.
 
 ```typescript
-import { createWeChatAcpAdapter } from "chat-adapter-wechat/acp";
+import { createWeChatAcpAdapter, type QrLoginError } from "chat-adapter-wechat/acp";
 
-async function onboardBot(botId: string) {
+app.post("/wechat/onboard/:botId", async (req, res) => {
+  const { botId } = req.params;
   const wechat = createWeChatAcpAdapter({
     botId,
     accountStorage: pgAccountStorage(botId), // your shared store
+  });
+
+  // Fetches the QR code, kicks off polling in the background, returns
+  // immediately. AccountData is persisted to pgAccountStorage on success.
+  const session = await wechat.startQrLogin();
+
+  // Return the image to the frontend right away.
+  res.json({ qr: session.qrcode.imageBase64 });
+
+  // Hand off the eventual scan result. Errors are typed as QrLoginError
+  // with a discriminated `code` field. The result promise has an
+  // internal .catch() so an unobserved rejection cannot crash Node.
+  session.result
+    .then((account) => notifyOpsScanned(botId, account.botId))
+    .catch((err: QrLoginError) => {
+      if (err.code === "expired") notifyOpsExpired(botId);
+      // err.code === "cancelled" fires if you stop the bot mid-scan
+    });
+});
+```
+
+**Bound the scan window with your own timer.** The adapter does not
+impose a wall-clock deadline — it polls until iLink reports `expired`,
+the scan succeeds, you call `cancel()`, or the bot is shut down. If
+you want a hard deadline (e.g. give the operator 30 minutes to walk
+to their phone), race `result` against your own timer and cancel from
+the loser:
+
+```typescript
+const session = await wechat.startQrLogin();
+const account = await Promise.race([
+  session.result,
+  new Promise<never>((_, rej) =>
+    setTimeout(() => {
+      session.cancel(); // also rejects session.result with code: "cancelled"
+      rej(new Error("operator did not scan within 30 minutes"));
+    }, 30 * 60 * 1000)
+  ),
+]);
+```
+
+**Interactive / single-process onboarding** can use the convenience
+wrapper `loginWithQr()`, which fires the configured `onQrCode`
+callback and awaits the result inline:
+
+```typescript
+async function onboardBotInteractive(botId: string) {
+  const wechat = createWeChatAcpAdapter({
+    botId,
+    accountStorage: pgAccountStorage(botId),
     onQrCode: (qr, ctx) => {
       myApp.publishQr(ctx.botId!, qr.imageBase64);
     },
   });
-
-  // No Chat instance, no polling. Just runs the QR flow and writes
-  // AccountData into pgAccountStorage. Returns when the user has scanned.
   const account = await wechat.loginWithQr();
   console.log("Onboarded", account.botId);
 }
@@ -254,7 +309,7 @@ storage hooks for each:
 
 | Hook | Type | Written by | Read by | Contents |
 |------|------|------------|---------|----------|
-| `accountStorage` | `WeChatStorage<AccountData>` | scan side (`loginWithQr`) | polling side (`initialize`) | `botToken`, iLink `botId` / `userId`, `baseUrl`, `savedAt` |
+| `accountStorage` | `WeChatStorage<AccountData>` | scan side (`startQrLogin` or `loginWithQr`) | polling side (`initialize`) | `botToken`, iLink `botId` / `userId`, `baseUrl`, `savedAt` |
 | `stateStorage` | `WeChatStorage<PollState>` | polling side (continuously) | polling side (on restart) | `updatesBuf` (long-poll cursor), `contextTokens`, `lastMessageId` |
 
 `updatesBuf` is the load-bearing field — losing it means the next poll
@@ -281,8 +336,9 @@ next `getupdates` call, which the adapter surfaces as an
 - **`onAuthFailure` configured (recommended for headless workers):**
   the callback runs once with `{ botId, metadata }`, then the polling
   loop stops cleanly. Re-onboarding must happen out-of-band by calling
-  `loginWithQr()` from your scan worker. There is no in-band warning
-  before expiry — the first signal is the 401.
+  `startQrLogin()` from your scan worker (or `loginWithQr()` if your
+  scan worker is interactive). There is no in-band warning before
+  expiry — the first signal is the 401.
 - **`onAuthFailure` NOT configured (legacy single-process behavior):**
   the polling loop attempts an in-process `loginWithQr()` to recover.
   Fine for interactive single-bot deployments; wrong for headless
@@ -342,10 +398,13 @@ All options are optional — defaults are shown below.
 
 | Method | When to use |
 |--------|-------------|
-| `loginWithQr(): Promise<AccountData>` | Run the QR scan flow and persist `AccountData`. No `Chat` instance needed; safe to call from a dedicated scan worker. Returns the persisted `AccountData`. |
+| `startQrLogin(): Promise<QrLoginSession>` | **Headless / split-process scan flows.** Returns immediately with `{ qrcode, result, cancel }` so an HTTP handler can ship the QR image and let the scan resolve in the background. The polling loop runs until iLink reports `expired`, `cancel()` is called, the scan succeeds, or `disconnect()` cancels in-flight sessions. The `result` promise has an internal `.catch()` so an unobserved rejection cannot crash Node via `unhandledRejection`. |
+| `loginWithQr(): Promise<AccountData>` | **Interactive / single-process onboarding.** Convenience wrapper around `startQrLogin()`: fetches the QR, fires `onQrCode`, awaits `session.result` inline. No `Chat` instance needed. |
 | `initialize(chat)` | Single-process: load existing `AccountData` or scan if missing, then start polling. |
-| `initialize(chat, { requireExistingAccount: true })` | Polling-worker: start polling against an `AccountData` provisioned earlier by `loginWithQr` (typically in another process). Throws if no account is in `accountStorage`. |
-| `disconnect()` | Stop polling and flush state. |
+| `initialize(chat, { requireExistingAccount: true })` | Polling-worker: start polling against an `AccountData` provisioned earlier by `loginWithQr` / `startQrLogin` (typically in another process). Throws if no account is in `accountStorage`. |
+| `disconnect()` | Stop polling, drain shutdown signal to the pending-queue drainer (so a large backlog doesn't block disconnect), cancel any in-flight `startQrLogin` sessions, and flush state. |
+
+`QrLoginError` is the rejection type of `session.result` and carries a discriminated `code: "expired" \| "cancelled" \| "network"` so you can branch on the cause without string-matching. Both `QrLoginError` and `QrLoginSession` are exported from `chat-adapter-wechat/acp`.
 
 ```typescript
 createWeChatAcpAdapter({
