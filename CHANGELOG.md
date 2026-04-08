@@ -1,5 +1,48 @@
 # chat-adapter-wechat
 
+## 0.3.0
+
+### Minor Changes
+
+- [#2](https://github.com/sang4lv/chat-adapter-wechat/pull/2) [`b09f333`](https://github.com/sang4lv/chat-adapter-wechat/commit/b09f33384e1742d9b8b60b5989aef0e6950393c6) Thanks [@sang4lv](https://github.com/sang4lv)! - ACP mode: crash resilience, multi-bot gateways, split scan/polling.
+
+  **Crash resilience.** The ACP adapter now durably persists every message
+  in a `getupdates` batch to the chat-sdk state queue _before_ advancing
+  the iLink long-poll cursor. iLink does not redeliver messages once the
+  cursor moves, so the previous fire-and-forget dispatch could lose
+  messages on instance crashes mid-batch. Persistence requires a
+  `StateAdapter` that implements `enqueue` / `dequeue` / `queueDepth`
+  (state-memory and state-pg both qualify).
+
+  **Multi-bot gateway support.** New optional `botId` and `metadata`
+  options on `createWeChatAcpAdapter`. `botId` scopes the adapter `name`,
+  the durable pending queue key, and the default `dataDir` so multiple
+  adapters can coexist behind one `Chat` and one shared state backend
+  without colliding. `metadata` is opaque caller-supplied data surfaced
+  unchanged via `onQrCode` / `onAuthFailure` callback contexts and as
+  `(message.adapter as WeChatAcpAdapter).metadata` for handler-side
+  lookup. Both options are optional — single-bot deployments are
+  unchanged.
+
+  **Split scan and polling across processes.** New
+  `loginWithQr(): Promise<AccountData>` runs only the QR scan flow and
+  persists `AccountData` via `accountStorage` — no `Chat` instance
+  needed, safe to call from a dedicated scan worker. New
+  `initialize(chat, { requireExistingAccount: true })` refuses to scan
+  and throws if no account is in storage, intended for headless polling
+  workers whose credentials were provisioned earlier in another process.
+
+  **Auth failure handoff.** New optional `onAuthFailure` callback. When
+  configured, an iLink 401/403 stops polling cleanly after running the
+  callback (instead of attempting an in-process re-scan). Use this in
+  headless workers to delete stale credentials and signal a separate
+  scan worker to re-onboard out-of-band.
+
+  **Signature changes (additive, non-breaking).** `onQrCode` now receives
+  a second `context: { botId?, metadata? }` argument; existing
+  single-argument callbacks continue to work. New exports from
+  `chat-adapter-wechat/acp`: `AccountData`, `PollState`, `WeChatStorage`.
+
 ## 0.2.0
 
 ### Minor Changes
