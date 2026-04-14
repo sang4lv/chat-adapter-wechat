@@ -55,6 +55,7 @@ export class WeChatBotAdapter extends WeChatBaseAdapter {
       token: config.token,
       aesKey: config.aesKey,
       baseUrl: config.baseUrl,
+      logger,
     });
     this.env = config.env ?? "online";
   }
@@ -70,14 +71,14 @@ export class WeChatBotAdapter extends WeChatBaseAdapter {
       this.logger.info("WeChat Bot adapter initialized (official dialog platform)");
     } catch (error) {
       this.logger.error("Failed to initialize WeChat Bot adapter", {
-        error: String(error),
+        error,
       });
       throw error;
     }
   }
 
   async disconnect(): Promise<void> {
-    // No persistent connections to clean up
+    this.logger.info("WeChat Bot adapter disconnected");
   }
 
   // --- Sending (query the bot) ---
@@ -99,6 +100,7 @@ export class WeChatBotAdapter extends WeChatBaseAdapter {
     }
 
     // Query the official dialog platform
+    this.logger.info("Querying bot", { conversationId, textLength: text.length });
     const response = await this.client.query({
       query: text,
       userid: conversationId,

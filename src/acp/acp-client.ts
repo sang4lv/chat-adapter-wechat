@@ -10,6 +10,13 @@ import {
   CHANNEL_VERSION,
   BOT_TYPE,
 } from "../core/types.js";
+
+/** Minimal logger for HTTP-level diagnostics. */
+interface ClientLogger {
+  info(msg: string, meta?: Record<string, unknown>): void;
+  warn(msg: string, meta?: Record<string, unknown>): void;
+  error(msg: string, meta?: Record<string, unknown>): void;
+}
 import type {
   IlinkGetUpdatesResponse,
   IlinkGetConfigResponse,
@@ -24,6 +31,7 @@ export interface IlinkClientConfig {
   baseUrl: string;
   cdnBaseUrl: string;
   token?: string;
+  logger?: ClientLogger;
 }
 
 export interface SendMessageParams {
@@ -41,11 +49,13 @@ export class IlinkClient {
   private baseUrl: string;
   private cdnBaseUrl: string;
   private token: string | undefined;
+  private readonly logger?: ClientLogger;
 
   constructor(config: IlinkClientConfig) {
     this.baseUrl = config.baseUrl.replace(/\/+$/, "");
     this.cdnBaseUrl = config.cdnBaseUrl.replace(/\/+$/, "");
     this.token = config.token;
+    this.logger = config.logger;
   }
 
   setToken(token: string): void {
@@ -98,6 +108,11 @@ export class IlinkClient {
 
       const text = await response.text();
       if (!response.ok) {
+        this.logger?.warn("HTTP error from iLink API", {
+          endpoint,
+          status: response.status,
+          body: text.slice(0, 200),
+        });
         if (response.status === 429) {
           throw new AdapterRateLimitError("wechat-acp");
         }
@@ -112,6 +127,7 @@ export class IlinkClient {
       const parsed = JSON.parse(text) as T & { ret?: number; errcode?: number };
       // Check ilink-level error codes
       if (parsed.errcode === 210205 || parsed.ret === 210205) {
+        this.logger?.warn("iLink rate limit hit", { endpoint });
         throw new AdapterRateLimitError("wechat-acp");
       }
       return parsed;
@@ -235,6 +251,10 @@ export class IlinkClient {
     const response = await fetch(url);
     if (!response.ok) {
       const body = await response.text().catch(() => "(unreadable)");
+      this.logger?.warn("Failed to fetch QR code", {
+        status: response.status,
+        body: body.slice(0, 200),
+      });
       throw new AuthenticationError(
         "wechat-acp",
         `Failed to fetch QR code: ${response.status} ${body}`
@@ -314,12 +334,17 @@ export class IlinkClient {
       const errMsg =
         response.headers.get("x-error-message") ??
         (await response.text().catch(() => "")).slice(0, 200);
+      this.logger?.warn("CDN upload client error", {
+        status: response.status,
+        error: errMsg,
+      });
       throw new NetworkError(
         "wechat-acp",
         `CDN upload client error ${response.status}: ${errMsg}`
       );
     }
     if (!response.ok) {
+      this.logger?.warn("CDN upload failed", { status: response.status });
       throw new NetworkError(
         "wechat-acp",
         `CDN upload failed: ${response.status}`
@@ -342,6 +367,7 @@ export class IlinkClient {
     const url = `${this.cdnBaseUrl}/download?encrypted_query_param=${encodeURIComponent(encryptQueryParam)}`;
     const response = await fetch(url, { signal: AbortSignal.timeout(60_000) });
     if (!response.ok) {
+      this.logger?.warn("CDN download failed", { status: response.status });
       throw new NetworkError(
         "wechat-acp",
         `CDN download failed: ${response.status}`
