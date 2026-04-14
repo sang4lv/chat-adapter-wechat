@@ -1,5 +1,11 @@
 # chat-adapter-wechat
 
+## 0.3.2
+
+### Patch Changes
+
+- [#6](https://github.com/sang4lv/chat-adapter-wechat/pull/6) [`efaa07d`](https://github.com/sang4lv/chat-adapter-wechat/commit/efaa07d790e01406ec5d5815a80e8d022e6bab03) Thanks [@sang4lv](https://github.com/sang4lv)! - Fix isMe check using wrong identity — applyAccount now sets botUserId to account.botId (the iLink bot identity) instead of account.userId (the WeChat OpenID of the QR scanner), which caused all incoming user messages to be incorrectly flagged as bot-authored and dropped.
+
 ## 0.3.1
 
 ### Patch Changes
