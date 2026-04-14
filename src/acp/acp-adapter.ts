@@ -193,7 +193,7 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
       stateStorage: config.stateStorage,
     };
 
-    this.client = new IlinkClient({ baseUrl, cdnBaseUrl });
+    this.client = new IlinkClient({ baseUrl, cdnBaseUrl, logger });
     this.typingIntervalMs = this.config.typingIntervalMs;
   }
 
@@ -249,6 +249,7 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
   }
 
   async disconnect(): Promise<void> {
+    this.logger.info("Disconnecting adapter", { botId: this.botId });
     this.isShutdown = true;
     this.pollingActive = false;
     this.pollingAbortController?.abort();
@@ -382,7 +383,7 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
         }
       } catch (error) {
         this.logger.error("QR login polling error", {
-          error: String(error),
+          error,
           botId: this.botId,
         });
         rejectResult(
@@ -462,6 +463,7 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
 
   private async pollingLoop(): Promise<void> {
     let consecutiveFailures = 0;
+    this.logger.info("Polling loop started", { botId: this.botId, pollIntervalMs: this.config.pollIntervalMs });
 
     while (this.pollingActive) {
       try {
@@ -470,6 +472,9 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
           this.config.pollIntervalMs,
           this.pollingAbortController?.signal
         );
+        if (response.msgs?.length) {
+          this.logger.info("Poll received messages", { botId: this.botId, count: response.msgs.length });
+        }
 
         await this.handlePollResponse(response);
 
@@ -495,7 +500,7 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
               });
             } catch (hookError) {
               this.logger.error("onAuthFailure callback threw", {
-                error: String(hookError),
+                error: hookError,
               });
             }
             this.pollingActive = false;
@@ -508,7 +513,7 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
             continue;
           } catch (reLoginError) {
             this.logger.error("Re-login failed", {
-              error: String(reLoginError),
+              error: reLoginError,
             });
           }
         }
@@ -516,7 +521,7 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
         consecutiveFailures++;
         const backoffMs = Math.min(1000 * 2 ** consecutiveFailures, 60_000);
         this.logger.warn(`Polling error (retry in ${backoffMs}ms)`, {
-          error: String(error),
+          error,
           failures: consecutiveFailures,
         });
         await new Promise((r) => setTimeout(r, backoffMs));
@@ -615,6 +620,10 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
       expiresAt: now + PENDING_QUEUE_TTL_MS,
     };
     await state.enqueue(this.pendingQueueKey, entry, PENDING_QUEUE_MAX_SIZE);
+    this.logger.info("Message enqueued to pending queue", {
+      messageId: msg.message_id,
+      fromUserId: msg.from_user_id,
+    });
   }
 
   /**
@@ -642,16 +651,30 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
   protected async drainPendingQueue(): Promise<void> {
     if (!this.chat) return;
     const state = this.chat.getState();
+    let dispatched = 0;
     while (!this.isShutdown) {
       const entry = await state.dequeue(this.pendingQueueKey);
-      if (!entry) return;
-      if (Date.now() > entry.expiresAt) continue;
+      if (!entry) {
+        if (dispatched > 0) {
+          this.logger.info("Pending queue drained", { dispatched });
+        }
+        return;
+      }
+      if (Date.now() > entry.expiresAt) {
+        this.logger.warn("Skipping expired pending message", {
+          messageId: entry.message?.id,
+          enqueuedAt: entry.enqueuedAt,
+          expiresAt: entry.expiresAt,
+        });
+        continue;
+      }
 
       // After a JSON roundtrip via the state adapter, entry.message is a
       // plain object. Rehydrate it back into a Message instance so chat-sdk
       // can use class methods like detectMention.
       const message = this.rehydrateMessage(entry.message);
       this.chat.processMessage(this, message.threadId, message);
+      dispatched++;
     }
   }
 
@@ -799,6 +822,11 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
     }
 
     // Send message — conversationId is userId for DMs, groupId for groups
+    this.logger.info("Sending message", {
+      toUserId: conversationId,
+      hasText: Boolean(text),
+      imageCount: imageUploads.length,
+    });
     await this.client.sendMessage({
       toUserId: conversationId,
       text: text || undefined,
@@ -838,8 +866,24 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
       if (config.typing_ticket) {
         await this.client.sendTyping(conversationId, config.typing_ticket, 1);
       }
-    } catch {
-      // Typing is best-effort
+    } catch (error) {
+      // Typing is best-effort; log so transient issues are diagnosable
+      this.logger.warn("Typing indicator failed", { error });
+    }
+  }
+
+  override async stopTyping(threadId: string): Promise<void> {
+    try {
+      const { conversationId } = resolveThreadId(threadId);
+      const ctx = this.pollState.contextTokens[conversationId];
+      if (!ctx) return;
+
+      const config = await this.client.getConfig(conversationId, ctx);
+      if (config.typing_ticket) {
+        await this.client.sendTyping(conversationId, config.typing_ticket, 0);
+      }
+    } catch (error) {
+      this.logger.warn("Stop typing indicator failed", { error });
     }
   }
 
@@ -859,6 +903,10 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
     aesKeyB64: string;
     ciphertextSize: number;
   }> {
+    this.logger.info("Uploading image to CDN", {
+      toUserId,
+      rawSize: imageData.length,
+    });
     const aesKey = crypto.randomBytes(16);
     const aesKeyHex = aesKey.toString("hex");
     const rawSize = imageData.length;
@@ -915,7 +963,7 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
           const backoffMs = 2 ** attempt * 1000;
           this.logger.warn(
             `CDN upload attempt ${attempt} failed, retrying in ${backoffMs}ms`,
-            { error: String(error) }
+            { error }
           );
           await new Promise((r) => setTimeout(r, backoffMs));
         }
@@ -935,7 +983,11 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
       const filePath = path.join(this.config.dataDir, "account.json");
       const data = fs.readFileSync(filePath, "utf-8");
       return JSON.parse(data) as AccountData;
-    } catch {
+    } catch (error) {
+      this.logger.info("No saved account found on disk", {
+        dataDir: this.config.dataDir,
+        error,
+      });
       return null;
     }
   }
@@ -965,7 +1017,11 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
       const filePath = path.join(this.config.dataDir, "state.json");
       const data = fs.readFileSync(filePath, "utf-8");
       return JSON.parse(data) as PollState;
-    } catch {
+    } catch (error) {
+      this.logger.info("No saved poll state found, starting fresh", {
+        dataDir: this.config.dataDir,
+        error,
+      });
       return { updatesBuf: "", contextTokens: {}, lastMessageId: 0 };
     }
   }
@@ -978,8 +1034,11 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
       fs.mkdirSync(this.config.dataDir, { recursive: true });
       const filePath = path.join(this.config.dataDir, "state.json");
       fs.writeFileSync(filePath, JSON.stringify(this.pollState, null, 2));
-    } catch {
-      // Best-effort persistence
+    } catch (error) {
+      this.logger.warn("Failed to save poll state to disk", {
+        dataDir: this.config.dataDir,
+        error,
+      });
     }
   }
 }

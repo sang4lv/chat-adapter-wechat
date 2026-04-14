@@ -1,6 +1,7 @@
 #!/usr/bin/env npx tsx
 /**
  * Development server for testing WeChat adapters end-to-end.
+ * Written as a consumer of the chat-adapter-wechat public API.
  *
  * Supports two modes:
  *   - ACP mode (default): QR login → poll messages → echo replies
@@ -36,157 +37,160 @@
 
 import http from "node:http";
 import QRCode from "qrcode";
-import { IlinkClient } from "../src/acp/acp-client.js";
-import { MessageItemType, MessageType } from "../src/acp/acp-types.js";
-import type { IlinkMessage } from "../src/acp/acp-types.js";
-import { BotClient } from "../src/bot/bot-client.js";
+import { ConsoleLogger } from "chat";
+import type { ChatInstance, QueueEntry, StateAdapter } from "chat";
+import {
+  createWeChatAcpAdapter,
+  createWeChatBotAdapter,
+} from "../src/index.js";
+import type {
+  WeChatAcpAdapter,
+  WeChatBotAdapter,
+  WeChatRawMessage,
+  AccountData,
+} from "../src/index.js";
+
+// --- Config ---
 
 const PORT = Number(process.env.PORT) || 3000;
 const MODE = (process.env.WECHAT_MODE || "acp") as "acp" | "bot";
+const BOT_ENV = (process.env.WECHAT_BOT_ENV || "online") as "online" | "debug";
 
 // --- Shared State ---
-let messageLog: Array<{ time: string; from: string; text: string }> = [];
+
+const messageLog: Array<{ time: string; from: string; text: string }> = [];
+
+// =====================================================================
+// INFRASTRUCTURE — minimal ChatInstance for the dev server
+// =====================================================================
+
+function createInMemoryState(): StateAdapter {
+  const queues = new Map<string, QueueEntry[]>();
+  return {
+    enqueue: async (key: string, entry: QueueEntry, maxSize: number) => {
+      const q = queues.get(key) ?? [];
+      q.push(entry);
+      while (q.length > maxSize) q.shift();
+      queues.set(key, q);
+      return q.length;
+    },
+    dequeue: async (key: string) => queues.get(key)?.shift() ?? null,
+    queueDepth: async (key: string) => queues.get(key)?.length ?? 0,
+  } as StateAdapter;
+}
+
+function createDevChat(
+  onMessage: (adapter: WeChatAcpAdapter | WeChatBotAdapter, threadId: string, raw: WeChatRawMessage) => void,
+): ChatInstance {
+  const logger = new ConsoleLogger("info").child("dev-server");
+  const state = createInMemoryState();
+  return {
+    getLogger: () => logger,
+    getState: () => state,
+    getUserName: () => "dev-server",
+    handleIncomingMessage: async () => {},
+    processMessage: (adapter: unknown, threadId: string, message: unknown) => {
+      const msg = message as { raw: WeChatRawMessage };
+      onMessage(adapter as WeChatAcpAdapter | WeChatBotAdapter, threadId, msg.raw);
+    },
+    processAction: () => {},
+    processAppHomeOpened: () => {},
+    processAssistantContextChanged: () => {},
+    processAssistantThreadStarted: () => {},
+    processMemberJoinedChannel: () => {},
+    processModalClose: () => {},
+    processModalSubmit: async () => undefined,
+    processReaction: () => {},
+    processSlashCommand: () => {},
+  } as ChatInstance;
+}
 
 // =====================================================================
 // ACP MODE
 // =====================================================================
 
-const ACP_BASE_URL = process.env.WECHAT_BASE_URL || "https://ilinkai.weixin.qq.com";
-const ACP_CDN_URL = process.env.WECHAT_CDN_BASE_URL || "https://novac2c.cdn.weixin.qq.com/c2c";
-
-const acpClient = new IlinkClient({
-  baseUrl: ACP_BASE_URL,
-  cdnBaseUrl: ACP_CDN_URL,
-  token: process.env.WECHAT_BOT_TOKEN || undefined,
-});
-
-let acpBotToken = process.env.WECHAT_BOT_TOKEN || "";
-let acpBotId = process.env.WECHAT_BOT_ID || "";
-let acpUserId = process.env.WECHAT_USER_ID || "";
+let acpAdapter: WeChatAcpAdapter | null = null;
+let acpLoginStatus = "waiting";
 let qrImageDataUrl = "";
-let qrCode = "";
-let acpLoginStatus = acpBotToken ? "logged_in" : "waiting";
-let updatesBuf = "";
-let contextTokens: Record<string, string> = {};
-let lastMessageId = 0;
-let pollingActive = false;
 
-async function startQrLogin() {
+async function initAcpMode() {
+  const hasEnvCredentials =
+    process.env.WECHAT_BOT_TOKEN &&
+    process.env.WECHAT_BOT_ID &&
+    process.env.WECHAT_USER_ID;
+
+  const chat = createDevChat((adapter, threadId, raw) => {
+    const text = raw.text || "";
+    const mediaLabels = raw.media.map((m) => `[${m.kind}]`).join(" ");
+    const group = raw.groupId ? ` (group: ${raw.groupId})` : "";
+
+    messageLog.push({
+      time: new Date().toISOString(),
+      from: raw.fromUserId,
+      text: `${text}${mediaLabels}${group}`,
+    });
+    log(`← [${raw.fromUserId}]${group}: ${text} ${mediaLabels}`);
+
+    // Echo reply — include media JSON so you can inspect CDN payloads
+    const mediaDump = raw.media.length
+      ? `\n\nMedia:\n${JSON.stringify(raw.media, null, 2)}`
+      : "";
+    const reply = `Echo: ${text || "(media only)"}${mediaDump}`;
+
+    adapter
+      .postMessage(threadId, reply)
+      .then(() => {
+        log(`→ [bot]: ${reply}`);
+        messageLog.push({ time: new Date().toISOString(), from: "bot", text: reply });
+      })
+      .catch((err) => log(`Send error: ${err}`));
+  });
+
+  acpAdapter = createWeChatAcpAdapter({
+    baseUrl: process.env.WECHAT_BASE_URL,
+    cdnBaseUrl: process.env.WECHAT_CDN_BASE_URL,
+    onQrCode: async (qr) => {
+      qrImageDataUrl = await QRCode.toDataURL(qr.imageBase64, {
+        width: 300,
+        margin: 2,
+      });
+      acpLoginStatus = "qr_ready";
+      log("QR code ready. Scan at http://localhost:" + PORT);
+    },
+    accountStorage: {
+      async load(): Promise<AccountData | null> {
+        if (hasEnvCredentials) {
+          log("Using credentials from environment variables");
+          return {
+            botToken: process.env.WECHAT_BOT_TOKEN!,
+            botId: process.env.WECHAT_BOT_ID!,
+            userId: process.env.WECHAT_USER_ID!,
+            baseUrl:
+              process.env.WECHAT_BASE_URL ??
+              "https://ilinkai.weixin.qq.com",
+            savedAt: Date.now(),
+          };
+        }
+        return null;
+      },
+      async save(account: AccountData) {
+        log("Login successful! Set these env vars to skip QR next time:");
+        log(`  WECHAT_BOT_TOKEN=${account.botToken}`);
+        log(`  WECHAT_BOT_ID=${account.botId}`);
+        log(`  WECHAT_USER_ID=${account.userId}`);
+      },
+    },
+  });
+
   try {
-    const qr = await acpClient.fetchQrCode();
-    qrImageDataUrl = await QRCode.toDataURL(qr.qrcode_img_content, { width: 300, margin: 2 });
-    qrCode = qr.qrcode;
-    acpLoginStatus = "qr_ready";
-    log("QR code fetched. Scan at http://localhost:" + PORT);
-    pollQrStatus();
+    await acpAdapter.initialize(chat);
+    acpLoginStatus = "logged_in";
+    log(
+      `ACP adapter ready — botId=${acpAdapter.userName} userId=${acpAdapter.botUserId}`,
+    );
   } catch (err) {
-    log(`QR fetch failed: ${err}`);
+    log(`ACP initialization failed: ${err}`);
     acpLoginStatus = "error";
-  }
-}
-
-async function pollQrStatus() {
-  for (let i = 0; i < 60; i++) {
-    if (acpLoginStatus === "logged_in") return;
-    try {
-      const status = await acpClient.pollQrStatus(qrCode);
-      if (status.status === "confirmed") {
-        acpBotToken = status.bot_token!;
-        acpBotId = status.ilink_bot_id!;
-        acpUserId = status.ilink_user_id!;
-        acpClient.setToken(acpBotToken);
-        acpLoginStatus = "logged_in";
-        log(`Login successful! botId=${acpBotId} userId=${acpUserId}`);
-        log(`Save for next time:`);
-        log(`  WECHAT_BOT_TOKEN=${acpBotToken}`);
-        log(`  WECHAT_BOT_ID=${acpBotId}`);
-        log(`  WECHAT_USER_ID=${acpUserId}`);
-        startAcpPolling();
-        return;
-      }
-      if (status.status === "expired") {
-        log("QR expired. Refreshing...");
-        await startQrLogin();
-        return;
-      }
-      if (status.status === "scaned") {
-        acpLoginStatus = "scanned";
-      }
-    } catch (err) {
-      log(`QR poll error: ${err}`);
-    }
-  }
-  log("QR poll timed out");
-}
-
-async function startAcpPolling() {
-  if (pollingActive) return;
-  pollingActive = true;
-  log("Polling for messages...");
-
-  let failures = 0;
-  while (pollingActive) {
-    try {
-      const result = await acpClient.getUpdates(updatesBuf, 25000);
-      if (result.get_updates_buf) updatesBuf = result.get_updates_buf;
-      for (const msg of result.msgs ?? []) await handleAcpMessage(msg);
-      failures = 0;
-    } catch (err) {
-      failures++;
-      const backoff = Math.min(1000 * 2 ** failures, 60000);
-      log(`Poll error (retry in ${backoff}ms): ${err}`);
-      await sleep(backoff);
-    }
-  }
-}
-
-async function handleAcpMessage(msg: IlinkMessage) {
-  if (msg.message_type === MessageType.BOT) return;
-  if (msg.message_id != null && msg.message_id <= lastMessageId) return;
-  if (msg.message_id != null) lastMessageId = msg.message_id;
-
-  const conversationKey = msg.group_id || msg.from_user_id || "";
-  if (conversationKey && msg.context_token) contextTokens[conversationKey] = msg.context_token;
-
-  let text = "";
-  const mediaItems: string[] = [];
-  for (const item of msg.item_list ?? []) {
-    if (item.type === MessageItemType.TEXT && item.text_item?.text) text += item.text_item.text;
-    if (item.type === MessageItemType.IMAGE) mediaItems.push("[image]");
-    if (item.type === MessageItemType.FILE) mediaItems.push(`[file: ${item.file_item?.file_name ?? "?"}]`);
-    if (item.type === MessageItemType.VOICE) mediaItems.push("[voice]");
-    if (item.type === MessageItemType.VIDEO) mediaItems.push("[video]");
-  }
-
-  const refSource = msg.ref_msg ?? msg.item_list?.[0]?.ref_msg;
-  let refText = "";
-  if (refSource) {
-    const refContent = refSource.message_item?.text_item?.text || refSource.title || "";
-    if (refContent) refText = ` [reply to: "${refContent}"]`;
-  }
-
-  const sender = msg.from_user_id ?? "unknown";
-  const group = msg.group_id ? ` (group: ${msg.group_id})` : "";
-  const mediaStr = mediaItems.length ? ` ${mediaItems.join(" ")}` : "";
-
-  messageLog.push({ time: new Date().toISOString(), from: sender, text: `${text}${refText}${mediaStr}${group}` });
-  log(`← [${sender}]${group}: ${text}${refText}${mediaStr}`);
-
-  const replyTo = msg.group_id || msg.from_user_id || "";
-  const ctx = contextTokens[replyTo] || msg.context_token || "";
-
-  try {
-    try {
-      const config = await acpClient.getConfig(replyTo, ctx);
-      if (config.typing_ticket) { await acpClient.sendTyping(replyTo, config.typing_ticket, 1); await sleep(500); }
-    } catch { /* best effort */ }
-
-    const reply = `Echo: ${text || "(media only)"}`;
-    await acpClient.sendMessage({ toUserId: replyTo, text: reply, contextToken: ctx });
-    log(`→ [bot]: ${reply}`);
-    messageLog.push({ time: new Date().toISOString(), from: "bot", text: reply });
-  } catch (err) {
-    log(`Send error: ${err}`);
   }
 }
 
@@ -194,43 +198,42 @@ async function handleAcpMessage(msg: IlinkMessage) {
 // BOT MODE
 // =====================================================================
 
-const BOT_APP_ID = process.env.WECHAT_APP_ID || "";
-const BOT_TOKEN = process.env.WECHAT_TOKEN || "";
-const BOT_AES_KEY = process.env.WECHAT_AES_KEY || "";
-const BOT_BASE_URL = process.env.WECHAT_BOT_BASE_URL || "https://openaiapi.weixin.qq.com";
-const BOT_ENV = (process.env.WECHAT_BOT_ENV || "online") as "online" | "debug";
-
-let botClient: BotClient | null = null;
+let botAdapter: WeChatBotAdapter | null = null;
 let botLoginStatus = "waiting";
-let botAppId = BOT_APP_ID;
-let botTokenValue = BOT_TOKEN;
-let botAesKey = BOT_AES_KEY;
+let botAppId = process.env.WECHAT_APP_ID || "";
 let botError = "";
 
 async function initBotMode() {
-  if (!botAppId || !botTokenValue || !botAesKey) {
+  const appId = process.env.WECHAT_APP_ID || "";
+  const token = process.env.WECHAT_TOKEN || "";
+  const aesKey = process.env.WECHAT_AES_KEY || "";
+
+  if (!appId || !token || !aesKey) {
     botLoginStatus = "needs_credentials";
     log("Bot mode: waiting for credentials via web UI");
     return;
   }
 
-  await connectBot(botAppId, botTokenValue, botAesKey);
+  await connectBot(appId, token, aesKey);
 }
 
 async function connectBot(appId: string, token: string, aesKey: string) {
-  botClient = new BotClient({
+  // Bot mode doesn't receive inbound messages — the consumer initiates queries
+  const chat = createDevChat(() => {});
+
+  const adapter = createWeChatBotAdapter({
     appId,
     token,
     aesKey,
-    baseUrl: BOT_BASE_URL,
+    baseUrl: process.env.WECHAT_BOT_BASE_URL,
+    env: BOT_ENV,
   });
 
   try {
-    log(`Exchanging APPID for AccessToken (appId=${appId})...`);
-    await botClient.getAccessToken();
+    log(`Verifying credentials (appId=${appId})...`);
+    await adapter.initialize(chat);
+    botAdapter = adapter;
     botAppId = appId;
-    botTokenValue = token;
-    botAesKey = aesKey;
     botLoginStatus = "logged_in";
     botError = "";
     log(`Bot mode ready! appId=${appId} env=${BOT_ENV}`);
@@ -238,42 +241,7 @@ async function connectBot(appId: string, token: string, aesKey: string) {
     log(`Bot auth failed: ${err}`);
     botLoginStatus = "needs_credentials";
     botError = String(err);
-    botClient = null;
   }
-}
-
-async function queryBot(queryText: string, userid?: string): Promise<string> {
-  if (!botClient) throw new Error("Bot client not initialized");
-
-  const response = await botClient.query({
-    query: queryText,
-    userid: userid || "dev-user",
-    env: BOT_ENV,
-  });
-
-  const answer = response.data.answer;
-  const status = response.data.status || "";
-  const skill = response.data.skill_name || "";
-
-  // Try to parse rich content
-  let displayText = answer;
-  try {
-    const parsed = JSON.parse(answer);
-    if (parsed.image?.url) displayText = `[Image: ${parsed.image.url}]`;
-    else if (parsed.voice?.url) displayText = `[Voice: ${parsed.voice.url}]`;
-    else if (parsed.video?.url) displayText = `[Video: ${parsed.video.url}]`;
-    else if (parsed.news?.articles) displayText = parsed.news.articles.map((a: any) => `${a.title} (${a.url})`).join("\n");
-    else if (parsed.generate_url) displayText = `[Streaming: ${parsed.generate_url}]`;
-    else if (parsed.multimsg) displayText = parsed.multimsg.join("\n");
-  } catch { /* plain text */ }
-
-  // Strip HTML tags, convert <a> to text (url) format
-  displayText = displayText
-    .replace(/<a\s+href="([^"]*)"[^>]*>([^<]*)<\/a>/gi, "$2 ($1)")
-    .replace(/<[^>]+>/g, "");
-
-  const meta = [status, skill].filter(Boolean).join(", ");
-  return meta ? `${displayText} [${meta}]` : displayText;
 }
 
 // =====================================================================
@@ -289,7 +257,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Allow switching to bot mode via /bot path
   if (url.pathname === "/bot" && req.method === "GET") {
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     res.end(renderBotPage());
@@ -298,70 +265,16 @@ const server = http.createServer(async (req, res) => {
 
   if (url.pathname === "/api/status" && req.method === "GET") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      mode: MODE,
-      loginStatus: MODE === "bot" ? botLoginStatus : acpLoginStatus,
-      botId: MODE === "bot" ? botAppId : acpBotId,
-      userId: MODE === "bot" ? "" : acpUserId,
-      messageCount: messageLog.length,
-      messages: messageLog.slice(-50),
-    }));
-    return;
-  }
-
-  // Webhook endpoint for receiving messages from WeChat dialog platform
-  if (url.pathname === "/webhook" && req.method === "POST") {
-    const body = await readBody(req);
-    try {
-      log(`← [webhook] Raw: ${body.slice(0, 200)}`);
-
-      let payload: any;
-      // Body may be JSON with "encrypted" field
-      try {
-        const json = JSON.parse(body);
-        if (json.encrypted && botClient && botAesKey) {
-          // Decrypt using WXBizMsgCrypt
-          const { wxDecrypt } = await import("../src/core/crypto.js");
-          const { message } = wxDecrypt(json.encrypted, botAesKey);
-          log(`← [webhook] Decrypted: ${message.slice(0, 200)}`);
-          // Parse XML-like content (simple extraction)
-          const userid = message.match(/<userid>(.*?)<\/userid>/)?.[1] || "";
-          const content = message.match(/<content>(.*?)<\/content>/s)?.[1] || "";
-          const from = message.match(/<from>(.*?)<\/from>/)?.[1] || "";
-          const event = message.match(/<event>(.*?)<\/event>/)?.[1] || "";
-          const kfstate = message.match(/<kfstate>(.*?)<\/kfstate>/)?.[1] || "";
-          const channel = message.match(/<channel>(.*?)<\/channel>/)?.[1] || "";
-
-          const msgContent = content.match(/<msg>(.*?)<\/msg>/s)?.[1] || content;
-          const source = from === "0" ? "user" : from === "1" ? "bot" : "kefu";
-
-          payload = { userid, content: msgContent, from: source, event, kfstate, channel };
-        } else {
-          payload = json;
-        }
-      } catch {
-        // Plain text body
-        payload = { raw: body };
-      }
-
-      const fromLabel = payload.from || "webhook";
-      const text = payload.content || payload.raw || JSON.stringify(payload);
-
-      messageLog.push({
-        time: new Date().toISOString(),
-        from: `${fromLabel}:${payload.userid || "?"}`,
-        text,
-      });
-      log(`← [${fromLabel}] userid=${payload.userid || "?"}: ${text}`);
-      if (payload.event) log(`   event=${payload.event} kfstate=${payload.kfstate} channel=${payload.channel}`);
-
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ errcode: 0, errmsg: "success" }));
-    } catch (err) {
-      log(`Webhook error: ${err}`);
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ errcode: -1, errmsg: String(err) }));
-    }
+    res.end(
+      JSON.stringify({
+        mode: MODE,
+        loginStatus: MODE === "bot" ? botLoginStatus : acpLoginStatus,
+        botId: MODE === "bot" ? botAppId : acpAdapter?.userName ?? "",
+        userId: MODE === "bot" ? "" : acpAdapter?.botUserId ?? "",
+        messageCount: messageLog.length,
+        messages: messageLog.slice(-50),
+      }),
+    );
     return;
   }
 
@@ -371,12 +284,19 @@ const server = http.createServer(async (req, res) => {
       const { appId, token, aesKey } = JSON.parse(body);
       if (!appId || !token || !aesKey) {
         res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "appId, token, and aesKey are required" }));
+        res.end(
+          JSON.stringify({ error: "appId, token, and aesKey are required" }),
+        );
         return;
       }
       await connectBot(appId, token, aesKey);
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: botLoginStatus === "logged_in", error: botError }));
+      res.end(
+        JSON.stringify({
+          ok: botLoginStatus === "logged_in",
+          error: botError,
+        }),
+      );
     } catch (err) {
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: String(err) }));
@@ -390,17 +310,24 @@ const server = http.createServer(async (req, res) => {
       const { to, text } = JSON.parse(body);
 
       if (MODE === "bot") {
-        // Bot mode: query the dialog platform
+        if (!botAdapter) throw new Error("Bot not connected");
         log(`→ [query]: ${text}`);
         messageLog.push({ time: new Date().toISOString(), from: "user", text });
 
-        const answer = await queryBot(text, to);
+        const response = await botAdapter.postMessage(
+          to || "dev-user",
+          text,
+        );
+        const answer = (response.raw as WeChatRawMessage).text;
         log(`← [bot]: ${answer}`);
-        messageLog.push({ time: new Date().toISOString(), from: "bot", text: answer });
+        messageLog.push({
+          time: new Date().toISOString(),
+          from: "bot",
+          text: answer,
+        });
       } else {
-        // ACP mode: send message to WeChat user
-        const ctx = contextTokens[to] || "";
-        await acpClient.sendMessage({ toUserId: to, text, contextToken: ctx });
+        if (!acpAdapter) throw new Error("ACP adapter not ready");
+        await acpAdapter.postMessage(to, text);
         log(`→ [bot → ${to}]: ${text}`);
         messageLog.push({ time: new Date().toISOString(), from: "bot", text });
       }
@@ -418,11 +345,17 @@ const server = http.createServer(async (req, res) => {
   res.end("Not found");
 });
 
-// --- ACP Pages ---
+// =====================================================================
+// HTML PAGES
+// =====================================================================
 
 function renderAcpPage(): string {
   if (acpLoginStatus === "logged_in") {
-    return renderDashboard("ACP", `OpenClaw bot <strong>${acpBotId}</strong>`, acpUserId);
+    return renderDashboard(
+      "ACP",
+      `OpenClaw bot <strong>${acpAdapter?.userName ?? "?"}</strong>`,
+      acpAdapter?.botUserId ?? "",
+    );
   }
   return `<!DOCTYPE html>
 <html><head><title>WeChat ACP - Login</title><meta charset="utf-8">
@@ -430,18 +363,20 @@ function renderAcpPage(): string {
 </head><body>
 <h2>WeChat ACP Login</h2>
 ${qrImageDataUrl
-  ? `<p>Scan this QR code with WeChat:</p><img src="${qrImageDataUrl}" width="300" height="300" style="border-radius:8px">`
-  : `<p>Loading QR code...</p>`}
+    ? `<p>Scan this QR code with WeChat:</p><img src="${qrImageDataUrl}" width="300" height="300" style="border-radius:8px">`
+    : `<p>Loading QR code...</p>`}
 <div class="status" id="status">${acpLoginStatus}</div>
 <script>setInterval(async()=>{const r=await fetch('/api/status');const d=await r.json();document.getElementById('status').textContent=d.loginStatus;if(d.loginStatus==='logged_in')location.reload()},2000)</script>
 </body></html>`;
 }
 
-// --- Bot Pages ---
-
 function renderBotPage(): string {
   if (botLoginStatus === "logged_in") {
-    return renderDashboard("Bot", `Dialog Platform <strong>${botAppId}</strong> (${BOT_ENV})`, "");
+    return renderDashboard(
+      "Bot",
+      `Dialog Platform <strong>${botAppId}</strong> (${BOT_ENV})`,
+      "",
+    );
   }
   return `<!DOCTYPE html>
 <html><head><title>WeChat Bot - Connect</title><meta charset="utf-8">
@@ -466,15 +401,15 @@ function renderBotPage(): string {
 </div>
 <div class="form">
   <label>APPID</label>
-  <input id="appId" placeholder="e.g. Gg8HejYTkUsEIlG" value="${botAppId}">
+  <input id="appId" placeholder="e.g. Gg8HejYTkUsEIlG" value="${process.env.WECHAT_APP_ID || ""}">
   <div class="hint">Robot identifier from the dialog platform</div>
 
   <label>Token</label>
-  <input id="token" placeholder="e.g. YV78Pyj1VvqdNGpMJ1pHic0bIBOWMv" value="${botTokenValue}">
+  <input id="token" placeholder="e.g. YV78Pyj1VvqdNGpMJ1pHic0bIBOWMv" value="${process.env.WECHAT_TOKEN || ""}">
   <div class="hint">Used for request signing</div>
 
   <label>AESKey</label>
-  <input id="aesKey" placeholder="e.g. q1Os1ZMe0nG28KUEx9lg3HjK7V5QyXvi212fzsgDqgz" value="${botAesKey}">
+  <input id="aesKey" placeholder="e.g. q1Os1ZMe0nG28KUEx9lg3HjK7V5QyXvi212fzsgDqgz" value="${process.env.WECHAT_AES_KEY || ""}">
   <div class="hint">43-character key for AES-256-CBC encryption</div>
 
   <button id="btn" onclick="connect()">Connect</button>
@@ -500,9 +435,11 @@ async function connect(){
 </body></html>`;
 }
 
-// --- Shared Dashboard ---
-
-function renderDashboard(mode: string, identity: string, defaultRecipient: string): string {
+function renderDashboard(
+  mode: string,
+  identity: string,
+  defaultRecipient: string,
+): string {
   const isBot = mode === "Bot";
   return `<!DOCTYPE html>
 <html><head><title>WeChat ${mode} Dev Server</title><meta charset="utf-8">
@@ -510,7 +447,7 @@ function renderDashboard(mode: string, identity: string, defaultRecipient: strin
   body{font-family:system-ui;max-width:800px;margin:40px auto;padding:0 20px;background:#f5f5f5}
   .status{background:#d4edda;padding:12px;border-radius:8px;margin-bottom:20px}
   .mode-badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:12px;font-weight:bold;margin-right:8px;${isBot ? "background:#007bff;color:white" : "background:#28a745;color:white"}}
-  .log{background:white;border-radius:8px;padding:16px;font-family:monospace;font-size:13px;max-height:500px;overflow-y:auto}
+  .log{background:white;border-radius:8px;padding:16px;font-family:monospace;font-size:13px;max-height:500px;overflow-y:auto;white-space:pre-wrap;word-break:break-all}
   .log div{padding:4px 0;border-bottom:1px solid #eee}
   .in{color:#0066cc}.out{color:#28a745}
   .send-form{margin:20px 0;display:flex;gap:8px}
@@ -526,8 +463,7 @@ function renderDashboard(mode: string, identity: string, defaultRecipient: strin
 <div class="send-form">
   ${isBot
     ? `<input id="to" type="hidden" value="dev-user"><input id="msg" placeholder="Ask the bot something..." style="flex:2">`
-    : `<input id="to" placeholder="Recipient user/group ID" value="${defaultRecipient}"><input id="msg" placeholder="Message text">`
-  }
+    : `<input id="to" placeholder="Recipient user/group ID" value="${defaultRecipient}"><input id="msg" placeholder="Message text">`}
   <button onclick="sendMsg()">${isBot ? "Query" : "Send"}</button>
 </div>
 
@@ -535,12 +471,13 @@ function renderDashboard(mode: string, identity: string, defaultRecipient: strin
 <div class="log" id="log">Loading...</div>
 
 <script>
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 async function refresh(){
   const res=await fetch('/api/status');const data=await res.json();const log=document.getElementById('log');
   log.innerHTML=data.messages.map(m=>
     '<div class="'+(m.from==='bot'?'out':'in')+'">'
     +'<small>'+m.time.slice(11,19)+'</small> '
-    +'<strong>'+m.from+':</strong> '+m.text+'</div>'
+    +'<strong>'+esc(m.from)+':</strong> '+esc(m.text)+'</div>'
   ).join('')||'<div>No messages yet.</div>';
   log.scrollTop=log.scrollHeight;
 }
@@ -557,25 +494,28 @@ refresh();setInterval(refresh,2000);
 </body></html>`;
 }
 
-// --- Helpers ---
+// =====================================================================
+// HELPERS
+// =====================================================================
 
 function readBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve) => {
     let body = "";
-    req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+    req.on("data", (chunk: Buffer) => {
+      body += chunk.toString();
+    });
     req.on("end", () => resolve(body));
   });
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
 }
 
 function log(msg: string) {
   console.log(`[${new Date().toISOString().slice(11, 19)}] ${msg}`);
 }
 
-// --- Start ---
+// =====================================================================
+// STARTUP & SHUTDOWN
+// =====================================================================
+
 server.listen(PORT, () => {
   console.log(`\n=== WeChat Dev Server (${MODE} mode) ===`);
   console.log(`http://localhost:${PORT}\n`);
@@ -583,12 +523,14 @@ server.listen(PORT, () => {
   if (MODE === "bot") {
     initBotMode();
   } else {
-    if (acpBotToken) {
-      log("Using saved ACP credentials. Starting message polling...");
-      startAcpPolling();
-    } else {
-      log("No ACP credentials. Starting QR login...");
-      startQrLogin();
-    }
+    initAcpMode();
   }
+});
+
+process.on("SIGINT", async () => {
+  log("Shutting down...");
+  await acpAdapter?.disconnect().catch(() => {});
+  await botAdapter?.disconnect().catch(() => {});
+  server.close();
+  process.exit(0);
 });

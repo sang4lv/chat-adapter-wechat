@@ -221,7 +221,11 @@ export abstract class WeChatBaseAdapter
   // --- Typing (overridden by bot adapter) ---
 
   async startTyping(_threadId: string, _status?: string): Promise<void> {
-    // No-op by default; bot adapter overrides
+    // No-op by default; ACP adapter overrides
+  }
+
+  async stopTyping(_threadId: string): Promise<void> {
+    // No-op by default; ACP adapter overrides
   }
 
   // --- Format ---
@@ -261,6 +265,7 @@ export abstract class WeChatBaseAdapter
       return await this.postMessage(threadId, fullText);
     } finally {
       clearInterval(typingInterval);
+      await this.stopTyping(threadId).catch(() => {});
     }
   }
 

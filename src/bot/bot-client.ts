@@ -16,6 +16,7 @@ import {
   AdapterRateLimitError,
   ValidationError,
 } from "@chat-adapter/shared";
+import type { ClientLogger } from "../core/types.js";
 import {
   computeSign,
   wxEncrypt,
@@ -37,6 +38,7 @@ export interface BotClientConfig {
   token: string;
   aesKey: string;
   baseUrl?: string;
+  logger?: ClientLogger;
 }
 
 export class BotClient {
@@ -44,6 +46,7 @@ export class BotClient {
   private readonly token: string;
   private readonly aesKey: string;
   private readonly baseUrl: string;
+  private readonly logger?: ClientLogger;
 
   private accessToken: string | null = null;
   private tokenExpiresAt = 0;
@@ -53,6 +56,7 @@ export class BotClient {
     this.token = config.token;
     this.aesKey = config.aesKey;
     this.baseUrl = (config.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
+    this.logger = config.logger;
   }
 
   // --- Token Management ---
@@ -85,6 +89,7 @@ export class BotClient {
     });
 
     if (response.status === 400) {
+      this.logger?.warn("Token refresh failed: signature verification error (HTTP 400)");
       throw new AuthenticationError(
         "wechat-bot",
         "Signature verification failed (HTTP 400). Check your APPID/Token."
@@ -92,16 +97,19 @@ export class BotClient {
     }
     if (!response.ok) {
       const text = await response.text().catch(() => "");
+      this.logger?.warn("Token refresh failed", { status: response.status, body: text.slice(0, 200) });
       throw new NetworkError("wechat-bot", `/v2/token ${response.status}: ${text}`);
     }
 
     const result = (await response.json()) as BotTokenResponse;
     if (result.code !== 0) {
+      this.logger?.warn("Token refresh returned error code", { code: result.code, msg: result.msg });
       this.handleErrorCode(result.code, result.msg);
     }
 
     this.accessToken = result.data.access_token;
     this.tokenExpiresAt = Date.now() + TOKEN_TTL_MS;
+    this.logger?.info("Access token refreshed successfully");
     return this.accessToken;
   }
 
@@ -133,6 +141,7 @@ export class BotClient {
 
     if (response.status === 400) {
       // Token may have expired, retry once
+      this.logger?.warn("Bot query got HTTP 400; invalidating token for retry");
       this.accessToken = null;
       throw new AuthenticationError(
         "wechat-bot",
@@ -141,6 +150,7 @@ export class BotClient {
     }
     if (!response.ok) {
       const text = await response.text().catch(() => "");
+      this.logger?.warn("Bot query failed", { status: response.status, body: text.slice(0, 200) });
       throw new NetworkError("wechat-bot", `/v2/bot/query ${response.status}: ${text}`);
     }
 
@@ -156,8 +166,11 @@ export class BotClient {
         const { message } = wxDecrypt(responseBody, this.aesKey);
         decryptedText = message;
       }
-    } catch {
+    } catch (decryptErr) {
       // If decryption fails, try as plain JSON
+      this.logger?.warn("Response decryption failed, falling back to raw body", {
+        error: decryptErr,
+      });
       decryptedText = responseBody;
     }
 
