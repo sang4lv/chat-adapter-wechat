@@ -1,5 +1,14 @@
 import type { Logger } from "chat";
 
+// --- Client Logger ---
+
+/** Minimal logger for HTTP-level diagnostics (no chat-sdk dependency). */
+export interface ClientLogger {
+  info(msg: string, meta?: Record<string, unknown>): void;
+  warn(msg: string, meta?: Record<string, unknown>): void;
+  error(msg: string, meta?: Record<string, unknown>): void;
+}
+
 // --- Thread ID ---
 
 export interface WeChatThreadId {

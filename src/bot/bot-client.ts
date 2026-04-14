@@ -16,13 +16,7 @@ import {
   AdapterRateLimitError,
   ValidationError,
 } from "@chat-adapter/shared";
-
-/** Minimal logger for HTTP-level diagnostics. */
-interface ClientLogger {
-  info(msg: string, meta?: Record<string, unknown>): void;
-  warn(msg: string, meta?: Record<string, unknown>): void;
-  error(msg: string, meta?: Record<string, unknown>): void;
-}
+import type { ClientLogger } from "../core/types.js";
 import {
   computeSign,
   wxEncrypt,

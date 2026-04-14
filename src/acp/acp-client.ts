@@ -9,14 +9,8 @@ import {
   QR_LONG_POLL_TIMEOUT_MS,
   CHANNEL_VERSION,
   BOT_TYPE,
+  ClientLogger,
 } from "../core/types.js";
-
-/** Minimal logger for HTTP-level diagnostics. */
-interface ClientLogger {
-  info(msg: string, meta?: Record<string, unknown>): void;
-  warn(msg: string, meta?: Record<string, unknown>): void;
-  error(msg: string, meta?: Record<string, unknown>): void;
-}
 import type {
   IlinkGetUpdatesResponse,
   IlinkGetConfigResponse,

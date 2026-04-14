@@ -650,7 +650,6 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
    */
   protected async drainPendingQueue(): Promise<void> {
     if (!this.chat) return;
-    this.logger.info("Draining pending message queue", { botId: this.botId });
     const state = this.chat.getState();
     let dispatched = 0;
     while (!this.isShutdown) {
