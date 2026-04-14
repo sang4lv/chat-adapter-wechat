@@ -443,7 +443,7 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
   /** Apply credentials from an `AccountData` to the live client + bot identity. */
   private applyAccount(account: AccountData): void {
     this.client.setToken(account.botToken);
-    this.setBotUserId(account.userId);
+    this.setBotUserId(account.botId);
     this.setUserName(account.botId);
   }
 

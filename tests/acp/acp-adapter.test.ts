@@ -47,7 +47,7 @@ describe("WeChatAcpAdapter", () => {
 
     it("extracts channel ID", () => {
       expect(
-        makeAdapter().channelIdFromThreadId("wechat:dm:user123:ctx456")
+        makeAdapter().channelIdFromThreadId("wechat:dm:user123:ctx456"),
       ).toBe("wechat:dm:user123");
     });
   });
@@ -152,6 +152,34 @@ describe("WeChatAcpAdapter", () => {
         raw: {},
       };
       expect(adapter.parseMessage(raw).isMention).toBe(true);
+    });
+
+    it("isMe is false for user messages after applyAccount sets botId correctly", () => {
+      const adapter = makeAdapter();
+      // Simulate applyAccount having run with botId = "ilink-bot-42", userId = "wechat-openid-xyz"
+      (adapter as any).setBotUserId("ilink-bot-42");
+
+      const userMsg = adapter.parseMessage({
+        messageId: 99,
+        fromUserId: "wechat-openid-xyz", // the QR scanner's OpenID — NOT the bot
+        toUserId: "ilink-bot-42",
+        text: "hi bot",
+        createTime: Date.now(),
+        media: [],
+        raw: {},
+      });
+      expect(userMsg.author.isMe).toBe(false); // was wrongly true before this fix
+
+      const botMsg = adapter.parseMessage({
+        messageId: 100,
+        fromUserId: "ilink-bot-42",
+        toUserId: "wechat-openid-xyz",
+        text: "hi user",
+        createTime: Date.now(),
+        media: [],
+        raw: {},
+      });
+      expect(botMsg.author.isMe).toBe(true);
     });
   });
 
