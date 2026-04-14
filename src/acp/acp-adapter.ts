@@ -873,6 +873,21 @@ export class WeChatAcpAdapter extends WeChatBaseAdapter {
     }
   }
 
+  override async stopTyping(threadId: string): Promise<void> {
+    try {
+      const { conversationId } = resolveThreadId(threadId);
+      const ctx = this.pollState.contextTokens[conversationId];
+      if (!ctx) return;
+
+      const config = await this.client.getConfig(conversationId, ctx);
+      if (config.typing_ticket) {
+        await this.client.sendTyping(conversationId, config.typing_ticket, 0);
+      }
+    } catch (error) {
+      this.logger.warn("Stop typing indicator failed", { error });
+    }
+  }
+
   // --- Media CDN ---
 
   protected async downloadFromCdn(encryptQueryParam: string): Promise<Buffer> {
